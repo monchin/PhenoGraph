@@ -44,8 +44,7 @@ def find_neighbors(data, k, use_gpu, metric='minkowski', p=2, method='brute', n_
             res = faiss.StandardGpuResources()
             index = faiss.IndexFlatL2(dimension) # for data under 1 million and under 50D, brute search is 
                                                  # enough for faiss especially using gpu
-            if use_gpu:
-                index = faiss.index_cpu_to_all_gpus(index)
+            index = faiss.index_cpu_to_all_gpus(index)
 
             batch_size = 400000
             batch_starts = np.arange(0, num, batch_size)
@@ -65,8 +64,7 @@ def find_neighbors(data, k, use_gpu, metric='minkowski', p=2, method='brute', n_
         elif metric.lower() == "ip":  # inner product
             res = faiss.StandardGpuResources()
             index = faiss.IndexFlatIP(dimension)
-            if use_gpu:
-                index = faiss.index_cpu_to_all_gpus(index)
+            index = faiss.index_cpu_to_all_gpus(index)
 
             batch_size = 400000
             batch_starts = np.arange(0, num, batch_size)
