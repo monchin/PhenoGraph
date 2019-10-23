@@ -28,15 +28,19 @@ def sort_by_size(clusters, min_size):
     return relabeled
 
 
-def cluster(data, k=30, directed=False, prune=False, min_cluster_size=10, jaccard=True,
+def cluster(data, k=30, d=None, idx=None, directed=False, prune=False, min_cluster_size=10, jaccard=True,
             primary_metric='euclidean', n_jobs=-1, q_tol=1e-3, louvain_time_limit=2000,
-            nn_method='kdtree'):
+            nn_method='kdtree', use_gpu=False):
     """
     PhenoGraph clustering
 
     :param data: Numpy ndarray of data to cluster, or sparse matrix of k-nearest neighbor graph
         If ndarray, n-by-d array of n cells in d dimensions
         If sparse matrix, n-by-n adjacency matrix
+    :param d: None or a Numpy ndarray with shape (data.shape[0], k-1), each data's (k-1) nearest neighbors' distance. 
+        If None, it would be calculated.
+    :param idx: None or a Numpy ndarray with shape (data.shape[0], k-1), each data's (k-1) nearest neighbors' index. 
+        If None, it would be calculated.
     :param k: Number of nearest neighbors to use in first step of graph construction
     :param directed: Whether to use a symmetric (default) or asymmetric ("directed") graph
         The graph construction process produces a directed graph, which is symmetrized by one of two methods (see below)
@@ -56,6 +60,7 @@ def cluster(data, k=30, directed=False, prune=False, min_cluster_size=10, jaccar
         the best result so far is returned
     :param nn_method: Whether to use brute force or kdtree for nearest neighbor search. For very large high-dimensional
         data sets, brute force (with parallel computation) performs faster than kdtree.
+    :param use_gpu: Whether to use GPU to calculate distance. Now only support euclidean and inner product metrics.
 
     :return communities: numpy integer array of community assignments for each row in data
     :return graph: numpy sparse array of the graph that was used for clustering
@@ -73,20 +78,32 @@ def cluster(data, k=30, directed=False, prune=False, min_cluster_size=10, jaccar
         kernel = parallel_jaccard_kernel
     kernelargs = {}
 
+    data = data.astype(np.float32)
+    if not data.flags.contiguous:
+        data = np.ascontiguousarray(data) # faiss must use contiguous array and float32!
+
     # Start timer
     tic = time.time()
     # Go!
-    if isinstance(data, sp.spmatrix) and data.shape[0] == data.shape[1]:
-        print("Using neighbor information from provided graph, rather than computing neighbors directly", flush=True)
-        lilmatrix = data.tolil()
-        d = np.vstack(lilmatrix.data).astype('float32')  # distances
-        idx = np.vstack(lilmatrix.rows).astype('int32')  # neighbor indices by row
-        del lilmatrix
-        assert idx.shape[0] == data.shape[0]
-        k = idx.shape[1]
+    if (d is not None) and (idx is not None):
+        assert d.shape == idx.shape, "d and idx has different shapes!"
+        assert idx.shape[0] == data.shape[0], "the number of rows of d is different with that of data!"
+        assert d.shape[1] != k-1, "not k-1 nearest neighbors!"
     else:
-        d, idx = find_neighbors(data, k=k, metric=primary_metric, method=nn_method, n_jobs=n_jobs)
-        print("Neighbors computed in {} seconds".format(time.time() - tic), flush=True)
+        if isinstance(data, sp.spmatrix) and data.shape[0] == data.shape[1]:
+            print("Using neighbor information from provided graph, rather than computing neighbors directly", flush=True)
+            lilmatrix = data.tolil()
+            d = np.vstack(lilmatrix.data).astype('float32')  # distances
+            idx = np.vstack(lilmatrix.rows).astype(
+                'int32')  # neighbor indices by row
+            del lilmatrix
+            assert idx.shape[0] == data.shape[0]
+            k = idx.shape[1]
+        else:
+            d, idx = find_neighbors(
+                data, k=k, use_gpu=use_gpu, metric=primary_metric, method=nn_method, n_jobs=n_jobs)
+            print("Neighbors computed in {} seconds".format(
+                time.time() - tic), flush=True)
 
     subtic = time.time()
     kernelargs['idx'] = idx
@@ -96,11 +113,13 @@ def cluster(data, k=30, directed=False, prune=False, min_cluster_size=10, jaccar
         kernelargs['sigma'] = 1.
         kernel = gaussian_kernel
         graph = neighbor_graph(kernel, kernelargs)
-        print("Gaussian kernel graph constructed in {} seconds".format(time.time() - subtic), flush=True)
+        print("Gaussian kernel graph constructed in {} seconds".format(
+            time.time() - subtic), flush=True)
     else:
         del d
         graph = neighbor_graph(kernel, kernelargs)
-        print("Jaccard graph constructed in {} seconds".format(time.time() - subtic), flush=True)
+        print("Jaccard graph constructed in {} seconds".format(
+            time.time() - subtic), flush=True)
     if not directed:
         if not prune:
             # symmetrize graph by averaging with transpose
@@ -114,7 +133,8 @@ def cluster(data, k=30, directed=False, prune=False, min_cluster_size=10, jaccar
     uid = uuid.uuid1().hex
     graph2binary(uid, graph)
     communities, Q = runlouvain(uid, tol=q_tol, time_limit=louvain_time_limit)
-    print("PhenoGraph complete in {} seconds".format(time.time() - tic), flush=True)
+    print("PhenoGraph complete in {} seconds".format(
+        time.time() - tic), flush=True)
     communities = sort_by_size(communities, min_cluster_size)
     # clean up
     for f in os.listdir():

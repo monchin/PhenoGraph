@@ -12,13 +12,14 @@ import sys
 from .bruteforce_nn import knnsearch
 
 
-def find_neighbors(data, k=30, metric='minkowski', p=2, method='brute', n_jobs=-1):
+def find_neighbors(data, k, use_gpu, metric='minkowski', p=2, method='brute', n_jobs=-1):
     """
     Wraps sklearn.neighbors.NearestNeighbors
     Find k nearest neighbors of every point in data and delete self-distances
 
     :param data: n-by-d data matrix
     :param k: number for nearest neighbors search
+    :param use_gpu: a bool, whether use GPU. 
     :param metric: string naming distance metric used to define neighbors
     :param p: if metric == "minkowski", p=2 --> euclidean, p=1 --> manhattan; otherwise ignored.
     :param method: 'brute' or 'kdtree'
@@ -27,35 +28,93 @@ def find_neighbors(data, k=30, metric='minkowski', p=2, method='brute', n_jobs=-
     :return d: n-by-k matrix of distances
     :return idx: n-by-k matrix of neighbor indices
     """
-    if metric.lower() == "euclidean":
-        metric = "minkowski"
-        p = 2
-    if metric.lower() == "manhattan":
-        metric = "minkowski"
-        p = 1
-    if metric.lower() == "minkowski":
-        algorithm = "auto"
-    elif metric.lower() == "cosine" or metric.lower() == "correlation":
-        algorithm = "brute"
-    else:
-        algorithm = "auto"
+    num, dimension = data.shape
 
-    print("Finding {} nearest neighbors using {} metric and '{}' algorithm".format(k, metric, algorithm),
-          flush=True)
-    if method == 'kdtree':
-        nbrs = NearestNeighbors(n_neighbors=k+1,        # k+1 because results include self
-                                n_jobs=n_jobs,              # use multiple cores if possible
-                                metric=metric,          # primary metric
-                                p=p,                    # if metric == "minkowski", 2 --> euclidean, 1 --> manhattan
-                                algorithm=algorithm     # kd_tree is fastest for minkowski metrics
-                                ).fit(data)
-        d, idx = nbrs.kneighbors(data)
+    use_faiss = False
+    if use_gpu:
+        use_faiss = True
+        try:
+            import faiss
+        except:
+            Warning("We highly reccomend you to install faiss to accelerate knn! Won't use GPU")
+            use_faiss = False
 
-    elif method == 'brute':
-        d, idx = knnsearch(data, k+1, metric)
+    if use_faiss:
+        if (metric.lower() == "euclidean") or ((metric.lower() == "minkowski") and (p == 2)):
+            res = faiss.StandardGpuResources()
+            index = faiss.IndexFlatL2(dimension) # for data under 1 million and under 50D, brute search is 
+                                                 # enough for faiss especially using gpu
+            if use_gpu:
+                index = faiss.index_cpu_to_all_gpus(index)
 
-    else:
-        raise ValueError("Invalid argument to `method` parameters: {}".format(method))
+            batch_size = 400000
+            batch_starts = np.arange(0, num, batch_size)
+            for each in batch_starts:
+                index.add(data[each:each+batch_size])
+
+            d_list, i_list = [], []
+            for each in batch_starts:
+                D, I = index.search(data[each:each+batch_size], k)
+                d_list.append(D)
+                i_list.append(I)
+
+            d = np.vstack(d_list)
+            d = np.sqrt(d)
+            idx = np.vstack(i_list)
+
+        elif metric.lower() == "ip":  # inner product
+            res = faiss.StandardGpuResources()
+            index = faiss.IndexFlatIP(dimension)
+            if use_gpu:
+                index = faiss.index_cpu_to_all_gpus(index)
+
+            batch_size = 400000
+            batch_starts = np.arange(0, num, batch_size)
+            for each in batch_starts:
+                index.add(data[each:each+batch_size])
+
+            d_list, i_list = [], []
+            for each in batch_starts:
+                D, I = index.search(data[each:each+batch_size], k)
+                d_list.append(D)
+                i_list.append(I)
+
+            d = np.vstack(d_list)
+            idx = np.vstack(i_list)
+        else:
+            use_faiss = False
+            
+    if not use_faiss:
+        if metric.lower() == "euclidean":
+            metric = "minkowski"
+            p = 2
+        if metric.lower() == "manhattan":
+            metric = "minkowski"
+            p = 1
+        if metric.lower() == "minkowski":
+            algorithm = "auto"
+        elif metric.lower() == "cosine" or metric.lower() == "correlation":
+            algorithm = "brute"
+        else:
+            algorithm = "auto"
+
+        print("Finding {} nearest neighbors using {} metric and '{}' algorithm".format(k, metric, algorithm),
+            flush=True)
+        if method == 'kdtree':
+            nbrs = NearestNeighbors(n_neighbors=k+1,        # k+1 because results include self
+                                    n_jobs=n_jobs,              # use multiple cores if possible
+                                    metric=metric,          # primary metric
+                                    p=p,                    # if metric == "minkowski", 2 --> euclidean, 1 --> manhattan
+                                    algorithm=algorithm     # kd_tree is fastest for minkowski metrics
+                                    ).fit(data)
+            d, idx = nbrs.kneighbors(data)
+
+        elif method == 'brute':
+            d, idx = knnsearch(data, k+1, metric)
+
+        else:
+            raise ValueError(
+                "Invalid argument to `method` parameters: {}".format(method))
 
     # Remove self-distances if these are in fact included
     if idx[0, 0] == 0:
@@ -96,7 +155,8 @@ def gaussian_kernel(idx, d, sigma):
     i = np.concatenate(np.array(i))
     j = np.concatenate(idx)
     d = np.concatenate(d)
-    f = np.vectorize(lambda x: 1/(sigma * (2 * np.pi) ** .5) * np.exp(-.5 * (x / sigma) ** 2))
+    f = np.vectorize(lambda x: 1/(sigma * (2 * np.pi) ** .5)
+                     * np.exp(-.5 * (x / sigma) ** 2))
     # apply vectorized gaussian function
     p = f(d)
     return i, j, p
@@ -111,7 +171,8 @@ def jaccard_kernel(idx):
     n, k = idx.shape
     s = list()
     for i in range(n):
-        shared_neighbors = np.fromiter((len(set(idx[i]).intersection(set(idx[j]))) for j in idx[i]), dtype=float)
+        shared_neighbors = np.fromiter(
+            (len(set(idx[i]).intersection(set(idx[j]))) for j in idx[i]), dtype=float)
         s.extend(shared_neighbors / (2 * k - shared_neighbors))
     i = np.concatenate(np.array([np.tile(x, (k, )) for x in range(n)]))
     j = np.concatenate(idx)
@@ -120,7 +181,8 @@ def jaccard_kernel(idx):
 
 def calc_jaccard(i, idx):
     """Compute the Jaccard coefficient between i and i's direct neighbors"""
-    coefficients = np.fromiter((len(set(idx[i]).intersection(set(idx[j]))) for j in idx[i]), dtype=float)
+    coefficients = np.fromiter(
+        (len(set(idx[i]).intersection(set(idx[j]))) for j in idx[i]), dtype=float)
     coefficients /= (2 * idx.shape[1] - coefficients)
     return idx[i], coefficients
 
@@ -193,7 +255,8 @@ def runlouvain(filename, max_runs=100, time_limit=2000, tol=1e-3):
     """
     def get_modularity(msg):
         # pattern = re.compile('modularity increased from -*0.\d+ to 0.\d+')
-        pattern = re.compile('modularity increased from -*\d.\d+e*-*\d+ to \d.\d+')
+        pattern = re.compile(
+            'modularity increased from -*\d.\d+e*-*\d+ to \d.\d+')
         matches = pattern.findall(msg.decode())
         q = list()
         for line in matches:
@@ -201,7 +264,7 @@ def runlouvain(filename, max_runs=100, time_limit=2000, tol=1e-3):
         return list(map(float, q))
 
     print('Running Louvain modularity optimization', flush=True)
-    
+
     # Use package location to find Louvain code
     # lpath = os.path.abspath(resource_filename(Requirement.parse("PhenoGraph"), 'louvain'))
     lpath = os.path.join(os.path.dirname(__file__), 'louvain')
@@ -250,7 +313,8 @@ def runlouvain(filename, max_runs=100, time_limit=2000, tol=1e-3):
 
         # run community
         fout = open(filename + '.tree', 'w')
-        args = [lpath + community_binary, filename + '_graph.bin', '-l', '-1', '-v', '-w', filename + '_graph.weights']
+        args = [lpath + community_binary, filename + '_graph.bin',
+                '-l', '-1', '-v', '-w', filename + '_graph.weights']
         p = subprocess.Popen(args, stdout=fout, stderr=subprocess.PIPE)
         # Here, we print communities to filename.tree and retain the modularity scores reported piped to stderr
         _, msg = p.communicate()
@@ -267,27 +331,33 @@ def runlouvain(filename, max_runs=100, time_limit=2000, tol=1e-3):
 
             # run hierarchy
             args = [lpath + hierarchy_binary, filename + '.tree']
-            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = p.communicate()
             # find number of levels in hierarchy and number of nodes in graph
             nlevels = int(re.findall('\d+', out.decode())[0])
-            nnodes = int(re.findall('level 0: \d+', out.decode())[0].split(sep=" ")[-1])
+            nnodes = int(re.findall('level 0: \d+', out.decode())
+                         [0].split(sep=" ")[-1])
 
             # get community assignments at each level in hierarchy
             hierarchy = np.empty((nnodes, nlevels), dtype='int')
             for level in range(nlevels):
-                    args = [lpath + hierarchy_binary, filename + '.tree', '-l', str(level)]
-                    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    out, err = p.communicate()
-                    h = np.empty((nnodes,))
-                    for i, line in enumerate(out.decode().splitlines()):
-                        h[i] = int(line.split(sep=' ')[-1])
-                    hierarchy[:, level] = h
+                args = [lpath + hierarchy_binary,
+                        filename + '.tree', '-l', str(level)]
+                p = subprocess.Popen(
+                    args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = p.communicate()
+                h = np.empty((nnodes,))
+                for i, line in enumerate(out.decode().splitlines()):
+                    h[i] = int(line.split(sep=' ')[-1])
+                hierarchy[:, level] = h
 
             communities = hierarchy[:, nlevels-1]
 
-            print("After {} runs, maximum modularity is Q = {}".format(run, Q), flush=True)
+            print("After {} runs, maximum modularity is Q = {}".format(
+                run, Q), flush=True)
 
-    print("Louvain completed {} runs in {} seconds".format(run, time.time() - tic), flush=True)
+    print("Louvain completed {} runs in {} seconds".format(
+        run, time.time() - tic), flush=True)
 
     return communities, Q
